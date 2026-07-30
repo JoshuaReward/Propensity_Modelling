@@ -1,0 +1,5 @@
+SELECT TOP (1000) [LocationID]
+      ,[ConsumerCombinationID]
+      ,[LocationAddress]
+      ,[IsNonLocational]
+  FROM [WH_NWG].[Trans].[Location]

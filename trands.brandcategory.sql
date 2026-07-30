@@ -1,0 +1,5 @@
+SELECT TOP (1000) [CategoryID]
+      ,[CategoryGroupID]
+      ,[CategoryName]
+      ,[ValueTier]
+  FROM [WH_AllPublishers].[Trans].[BrandCategory]

@@ -1,0 +1,8 @@
+SELECT TOP (1000) [FileID]
+      ,[RowNum]
+      ,[Amount]
+      ,[TranDate]
+      ,[BankAccountID]
+      ,[FanID]
+      ,[ConsumerCombinationID_DD]
+  FROM [WH_NWG].[Trans].[ConsumerTransaction_DD]
