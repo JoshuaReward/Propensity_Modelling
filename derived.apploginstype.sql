@@ -4,6 +4,7 @@ DECLARE @as_of_date DATE = CAST(GETDATE() AS DATE);
 DECLARE @period_1_days INT = 7;
 DECLARE @period_2_days INT = 14;
 DECLARE @period_3_days INT = 30;
+DECLARE @sample_size INT = 1000;
 DECLARE @cutoff_1 DATE = DATEADD(day, -@period_1_days, @as_of_date);
 DECLARE @cutoff_2 DATE = DATEADD(day, -@period_2_days, @as_of_date);
 DECLARE @cutoff_3 DATE = DATEADD(day, -@period_3_days, @as_of_date);
@@ -12,11 +13,11 @@ DECLARE @period_2_label NVARCHAR(50) = CONCAT('cutoff_', @period_2_days, 'd');
 DECLARE @period_3_label NVARCHAR(50) = CONCAT('cutoff_', @period_3_days, 'd');
 
 WITH customer_sample AS (
-    SELECT TOP (1000)
+    SELECT TOP (@sample_size)
         [CustomerGUID]
     FROM [WH_NWG].[Derived].[Customer]
     WHERE [CustomerGUID] IS NOT NULL
-    ORDER BY [CustomerGUID]
+    ORDER BY NEWID()
 ),
 login_counts AS (
     SELECT
@@ -90,7 +91,7 @@ login_metrics AS (
     GROUP BY
         c.[CustomerGUID]
 )
-SELECT TOP (1000)
+SELECT TOP (@sample_size)
     c.[FanID],
     c.[CustomerGUID],
     c.[ClubID],
