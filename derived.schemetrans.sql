@@ -13,6 +13,12 @@ WITH sampled_transactions AS (
         st.[FanID],
         st.[Spend],
         st.[TranDate],
+        st.[TranTime],
+        st.[RetailerCashback],
+        st.[Investment],
+        st.[RewardCommission],
+        st.[VATCommission],
+        st.[GrossCommission],
         st.[PartnerID],
         st.[PublisherID],
         st.[OfferID]
@@ -49,6 +55,64 @@ joined_transactions AS (
     INNER JOIN [WH_AllPublishers].[Trans].[BrandSectorGroup] AS g
         ON s.[SectorGroupID] = g.[SectorGroupID]
     WHERE st.[Spend] > 0
+),
+purchase_dates AS (
+    SELECT
+        [FanID],
+        CAST([TranDate] AS DATE) AS [PurchaseDate]
+    FROM joined_transactions
+    WHERE [TranDate] >= DATEADD(day, -@lookback_365, @as_of_date)
+    GROUP BY [FanID], CAST([TranDate] AS DATE)
+),
+purchase_intervals AS (
+    SELECT
+        [FanID],
+        [PurchaseDate],
+        DATEDIFF(day, LAG([PurchaseDate]) OVER (PARTITION BY [FanID] ORDER BY [PurchaseDate]), [PurchaseDate]) AS [DaysBetweenPurchases]
+    FROM purchase_dates
+),
+purchase_interval_metrics AS (
+    SELECT
+        [FanID],
+        AVG(CASE WHEN [DaysBetweenPurchases] IS NOT NULL THEN [DaysBetweenPurchases] END) AS [AvgDaysBetweenPurchases],
+        STDEV(CASE WHEN [DaysBetweenPurchases] IS NOT NULL THEN [DaysBetweenPurchases] END) AS [StdDevDaysBetweenPurchases]
+    FROM purchase_intervals
+    GROUP BY [FanID]
+),
+weekly_activity AS (
+    SELECT
+        [FanID],
+        DATEADD(week, DATEDIFF(week, 0, [PurchaseDate]), 0) AS [WeekStart]
+    FROM purchase_dates
+    GROUP BY [FanID], DATEADD(week, DATEDIFF(week, 0, [PurchaseDate]), 0)
+),
+weekly_activity_ranked AS (
+    SELECT
+        [FanID],
+        [WeekStart],
+        ROW_NUMBER() OVER (PARTITION BY [FanID] ORDER BY [WeekStart]) AS [RowNum],
+        DATEDIFF(week, 0, [WeekStart]) AS [WeekIndex]
+    FROM weekly_activity
+),
+weekly_activity_groups AS (
+    SELECT
+        [FanID],
+        ([WeekIndex] - [RowNum]) AS [GroupKey]
+    FROM weekly_activity_ranked
+),
+consecutive_week_metrics AS (
+    SELECT
+        [FanID],
+        MAX([GroupSize]) AS [ConsecutiveWeeksWithActivity]
+    FROM (
+        SELECT
+            [FanID],
+            [GroupKey],
+            COUNT(*) AS [GroupSize]
+        FROM weekly_activity_groups
+        GROUP BY [FanID], [GroupKey]
+    ) AS x
+    GROUP BY [FanID]
 ),
 customer_metrics AS (
     SELECT
@@ -104,70 +168,60 @@ customer_metrics AS (
     FROM joined_transactions
     GROUP BY [FanID]
 ),
-sector_spend AS (
+sector_purchase_summary AS (
     SELECT
         [FanID],
         [SectorName],
-        SUM([Spend]) AS [SectorSpend]
+        SUM([Spend]) AS [SectorSpend],
+        COUNT(*) AS [SectorPurchases]
     FROM joined_transactions
     GROUP BY [FanID], [SectorName]
 ),
-sector_pct AS (
+sector_ranked AS (
     SELECT
         [FanID],
         [SectorName],
         [SectorSpend],
-        [SectorSpend] / NULLIF(SUM([SectorSpend]) OVER (PARTITION BY [FanID]), 0) AS [SectorSpendPct]
-    FROM sector_spend
+        [SectorPurchases],
+        SUM([SectorSpend]) OVER (PARTITION BY [FanID]) AS [TotalSectorSpend],
+        ROW_NUMBER() OVER (PARTITION BY [FanID] ORDER BY [SectorPurchases] DESC, [SectorSpend] DESC, [SectorName]) AS [SectorRank]
+    FROM sector_purchase_summary
 ),
 sector_summary AS (
     SELECT
         [FanID],
         COUNT(DISTINCT [SectorName]) AS [UniqueSectorCategories],
         MAX(CASE WHEN [SectorRank] = 1 THEN [SectorName] END) AS [FavouriteSectorName],
-        STRING_AGG(CONCAT([SectorName], ':', CAST(ROUND([SectorSpendPct] * 100, 2) AS VARCHAR(20)), '%'), '; ') WITHIN GROUP (ORDER BY [SectorSpend] DESC) AS [SectorSpendPct]
-    FROM (
-        SELECT
-            [FanID],
-            [SectorName],
-            [SectorSpend],
-            [SectorSpendPct],
-            ROW_NUMBER() OVER (PARTITION BY [FanID] ORDER BY [SectorSpend] DESC, [SectorName]) AS [SectorRank]
-        FROM sector_pct
-    ) AS x
+        ROUND(100.0 * MAX(CASE WHEN [SectorRank] = 1 THEN [SectorSpend] END) / NULLIF(SUM([SectorSpend]), 0), 2) AS [SectorSpendPct]
+    FROM sector_ranked
     GROUP BY [FanID]
 ),
-group_spend AS (
+group_purchase_summary AS (
     SELECT
         [FanID],
         [GroupName],
-        SUM([Spend]) AS [GroupSpend]
+        SUM([Spend]) AS [GroupSpend],
+        COUNT(*) AS [GroupPurchases]
     FROM joined_transactions
     GROUP BY [FanID], [GroupName]
 ),
-group_pct AS (
+group_ranked AS (
     SELECT
         [FanID],
         [GroupName],
         [GroupSpend],
-        [GroupSpend] / NULLIF(SUM([GroupSpend]) OVER (PARTITION BY [FanID]), 0) AS [GroupSpendPct]
-    FROM group_spend
+        [GroupPurchases],
+        SUM([GroupSpend]) OVER (PARTITION BY [FanID]) AS [TotalGroupSpend],
+        ROW_NUMBER() OVER (PARTITION BY [FanID] ORDER BY [GroupPurchases] DESC, [GroupSpend] DESC, [GroupName]) AS [GroupRank]
+    FROM group_purchase_summary
 ),
 group_summary AS (
     SELECT
         [FanID],
         COUNT(DISTINCT [GroupName]) AS [UniqueGroupCategories],
         MAX(CASE WHEN [GroupRank] = 1 THEN [GroupName] END) AS [FavouriteGroupName],
-        STRING_AGG(CONCAT([GroupName], ':', CAST(ROUND([GroupSpendPct] * 100, 2) AS VARCHAR(20)), '%'), '; ') WITHIN GROUP (ORDER BY [GroupSpend] DESC) AS [GroupSpendPct]
-    FROM (
-        SELECT
-            [FanID],
-            [GroupName],
-            [GroupSpend],
-            [GroupSpendPct],
-            ROW_NUMBER() OVER (PARTITION BY [FanID] ORDER BY [GroupSpend] DESC, [GroupName]) AS [GroupRank]
-        FROM group_pct
-    ) AS x
+        ROUND(100.0 * MAX(CASE WHEN [GroupRank] = 1 THEN [GroupSpend] END) / NULLIF(SUM([GroupSpend]), 0), 2) AS [GroupSpendPct]
+    FROM group_ranked
     GROUP BY [FanID]
 )
 SELECT
@@ -184,6 +238,9 @@ SELECT
     END AS [SpendAccelerationPct_MonthVsPriorMonth],
     ROUND(CAST(cm.[Transactions_365d] AS DECIMAL(12, 2)) / 12.0, 2) AS [AvgMonthlyTransactions],
     DATEDIFF(day, cm.[LastPurchaseDate], @as_of_date) AS [DaysSinceLastPurchase],
+    pim.[AvgDaysBetweenPurchases],
+    pim.[StdDevDaysBetweenPurchases],
+    cwm.[ConsecutiveWeeksWithActivity],
     cm.[Purchases_7d],
     cm.[Purchases_30d],
     cm.[Purchases_90d],
@@ -213,12 +270,14 @@ SELECT
     COALESCE(ss.[UniqueSectorCategories], 0) AS [UniqueSectorCategories],
     COALESCE(gs.[UniqueGroupCategories], 0) AS [UniqueGroupCategories],
     ss.[FavouriteSectorName],
-    gs.[FavouriteGroupName],
     ss.[SectorSpendPct],
-    gs.[GroupSpendPct],
-    COALESCE(ss.[UniqueSectorCategories], 0) AS [SectorCategoryDiversity],
-    COALESCE(gs.[UniqueGroupCategories], 0) AS [GroupCategoryDiversity]
+    gs.[FavouriteGroupName],
+    gs.[GroupSpendPct]
 FROM customer_metrics AS cm
+LEFT JOIN purchase_interval_metrics AS pim
+    ON cm.[FanID] = pim.[FanID]
+LEFT JOIN consecutive_week_metrics AS cwm
+    ON cm.[FanID] = cwm.[FanID]
 LEFT JOIN sector_summary AS ss
     ON cm.[FanID] = ss.[FanID]
 LEFT JOIN group_summary AS gs
