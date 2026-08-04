@@ -24,21 +24,17 @@ FROM distinct_groups;
 
 SET @sql = N'
 SELECT
-    p.[CustomerGUID],
+    b.[BrandID],
     COUNT(*) AS [TotalTransactions],
     ' + @groupCols + N'
-FROM [WH_NWG].[Derived].[PartnerTrans] AS p
-INNER JOIN [WH_NWG].[Trans].[ConsumerCombination] AS cc
-    ON p.[MerchantID] = cc.[MID]
-LEFT JOIN [WH_AllPublishers].[Trans].[Brand] AS b
-    ON cc.[BrandID] = b.[BrandID]
+FROM [WH_AllPublishers].[Trans].[Brand] AS b
 LEFT JOIN [WH_AllPublishers].[Trans].[BrandSector] AS s
     ON b.[SectorID] = s.[SectorID]
 LEFT JOIN [WH_AllPublishers].[Trans].[BrandSectorGroup] AS g
     ON s.[SectorGroupID] = g.[SectorGroupID]
-WHERE p.[CustomerGUID] IS NOT NULL
-GROUP BY p.[CustomerGUID]
-ORDER BY p.[CustomerGUID];
+WHERE g.[GroupName] IS NOT NULL
+GROUP BY b.[BrandID]
+ORDER BY b.[BrandID];
 ';
 
 EXEC sp_executesql @sql;
