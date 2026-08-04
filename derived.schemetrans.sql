@@ -45,4 +45,7 @@ SELECT TOP (1000) [ID]
       ,[Narrative]
       ,[DPAN]
       ,[ARN]
-  FROM [WH_AllPublishers].[Derived].[SchemeTrans]
+  FROM from wh_allpublishers.derived.schemetrans st
+inner join wh_allpublishers.derived.partner a on st.partnerid=a.partnerid
+inner join wh_allpublishers.derived.publisher t on st.publisherid=t.publisherid
+inner join wh_allpublishers.derived.offer o on st.offerid=o.offerid
