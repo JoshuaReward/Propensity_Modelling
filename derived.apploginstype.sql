@@ -1,5 +1,6 @@
 SET NOCOUNT ON;
 
+-- Values to be defined, previous 7, 14, 30 days for app activity
 DECLARE @as_of_date DATE = CAST(GETDATE() AS DATE);
 DECLARE @period_1_days INT = 7;
 DECLARE @period_2_days INT = 14;
@@ -12,6 +13,7 @@ DECLARE @period_1_label NVARCHAR(50) = CONCAT('cutoff_', @period_1_days, 'd');
 DECLARE @period_2_label NVARCHAR(50) = CONCAT('cutoff_', @period_2_days, 'd');
 DECLARE @period_3_label NVARCHAR(50) = CONCAT('cutoff_', @period_3_days, 'd');
 
+-- Get sample first before dealing with entire dataset
 WITH customer_sample AS (
     SELECT TOP (@sample_size)
         [CustomerGUID]
@@ -19,6 +21,8 @@ WITH customer_sample AS (
     WHERE [CustomerGUID] IS NOT NULL
     ORDER BY NEWID()
 ),
+
+-- Number of logins
 login_counts AS (
     SELECT
         c.[CustomerGUID],
@@ -39,6 +43,8 @@ login_counts AS (
         c.[CustomerGUID],
         t.[LoginTypeDesc]
 ),
+
+-- Additional Behavioural activity metrics
 login_metrics AS (
     SELECT
         c.[CustomerGUID],
@@ -91,6 +97,8 @@ login_metrics AS (
     GROUP BY
         c.[CustomerGUID]
 )
+
+-- Final table including additional metrics such as acceleration
 SELECT TOP (@sample_size)
     c.[FanID],
     c.[CustomerGUID],
