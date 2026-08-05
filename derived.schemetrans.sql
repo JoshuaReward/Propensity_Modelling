@@ -7,8 +7,19 @@ DECLARE @lookback_30 INT = 30;
 DECLARE @lookback_90 INT = 90;
 DECLARE @lookback_365 INT = 365;
 
-WITH sampled_transactions AS (
+-- Get a random sample of 1000 or so customers
+WITH sampled_customers AS (
     SELECT TOP (@sample_size)
+        st.FanID
+    FROM [WH_AllPublishers].[Derived].[SchemeTrans] AS st
+    WHERE st.FanID IS NOT NULL
+    GROUP BY st.FanID
+    ORDER BY NEWID()
+),
+
+-- Joined sampled customers with their respective transaction history
+sampled_transactions AS (
+    SELECT
         st.[ID],
         st.[FanID],
         st.[Spend],
@@ -23,10 +34,10 @@ WITH sampled_transactions AS (
         st.[PublisherID],
         st.[OfferID]
     FROM [WH_AllPublishers].[Derived].[SchemeTrans] AS st
-    WHERE st.[FanID] IS NOT NULL
-      AND st.[TranDate] IS NOT NULL
-      AND st.[Spend] IS NOT NULL
-    ORDER BY NEWID()
+    INNER JOIN sampled_customers sc
+        ON st.FanID = sc.FanID
+    WHERE st.TranDate IS NOT NULL
+      AND st.Spend IS NOT NULL
 ),
 joined_transactions AS (
     SELECT
