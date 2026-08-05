@@ -184,7 +184,7 @@ sector_ranked AS (
         [SectorSpend],
         [SectorPurchases],
         SUM([SectorSpend]) OVER (PARTITION BY [FanID]) AS [TotalSectorSpend],
-        ROW_NUMBER() OVER (PARTITION BY [FanID] ORDER BY [SectorPurchases] DESC, [SectorSpend] DESC, [SectorName]) AS [SectorRank]
+        ROW_NUMBER() OVER (PARTITION BY [FanID] ORDER BY [SectorPurchases] DESC, [SectorName]) AS [SectorRank]
     FROM sector_purchase_summary
 ),
 sector_summary AS (
@@ -192,7 +192,7 @@ sector_summary AS (
         [FanID],
         COUNT(DISTINCT [SectorName]) AS [UniqueSectorCategories],
         MAX(CASE WHEN [SectorRank] = 1 THEN [SectorName] END) AS [FavouriteSectorName],
-        ROUND(100.0 * MAX(CASE WHEN [SectorRank] = 1 THEN [SectorSpend] END) / NULLIF(SUM([SectorSpend]), 0), 2) AS [SectorSpendPct]
+        ROUND(100.0 * MAX(CASE WHEN [SectorRank] = 1 THEN [SectorSpend] END) / NULLIF(MAX([TotalSectorSpend]), 0), 2) AS [SectorSpendPct]
     FROM sector_ranked
     GROUP BY [FanID]
 ),
@@ -212,7 +212,7 @@ group_ranked AS (
         [GroupSpend],
         [GroupPurchases],
         SUM([GroupSpend]) OVER (PARTITION BY [FanID]) AS [TotalGroupSpend],
-        ROW_NUMBER() OVER (PARTITION BY [FanID] ORDER BY [GroupPurchases] DESC, [GroupSpend] DESC, [GroupName]) AS [GroupRank]
+        ROW_NUMBER() OVER (PARTITION BY [FanID] ORDER BY [GroupPurchases] DESC, [GroupName]) AS [GroupRank]
     FROM group_purchase_summary
 ),
 group_summary AS (
@@ -220,7 +220,7 @@ group_summary AS (
         [FanID],
         COUNT(DISTINCT [GroupName]) AS [UniqueGroupCategories],
         MAX(CASE WHEN [GroupRank] = 1 THEN [GroupName] END) AS [FavouriteGroupName],
-        ROUND(100.0 * MAX(CASE WHEN [GroupRank] = 1 THEN [GroupSpend] END) / NULLIF(SUM([GroupSpend]), 0), 2) AS [GroupSpendPct]
+        ROUND(100.0 * MAX(CASE WHEN [GroupRank] = 1 THEN [GroupSpend] END) / NULLIF(MAX([TotalGroupSpend]), 0), 2) AS [GroupSpendPct]
     FROM group_ranked
     GROUP BY [FanID]
 )
