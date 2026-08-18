@@ -1,5 +1,5 @@
-WITH tbl AS(
-SELECT TOP (1000)c.[CustomerID]
+
+SELECT TOP (1000) c.[CustomerID]
       ,c.[SourceSystemID]
       ,c.[PublisherType]
       ,c.[PublisherID]
@@ -45,7 +45,5 @@ SELECT TOP (1000)c.[CustomerID]
       ON c.[CINID] = m.[CINID]
   INNER JOIN [WH_NWG].[Derived].[nw_cinid_mosaic_8] AS m2
       ON c.[CINID] = m2.[CINID]
-)
 
-SELECT CustomerGUID, COUNT(*) AS ROWCOUNT
-FROM tbl
+
