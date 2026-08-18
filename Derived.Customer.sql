@@ -1,4 +1,4 @@
---WITH tbl AS(
+WITH tbl AS(
 SELECT TOP (1000)c.[CustomerID]
       ,c.[SourceSystemID]
       ,c.[PublisherType]
@@ -39,12 +39,13 @@ SELECT TOP (1000)c.[CustomerID]
       ,c.[BrazeUserID]
       ,m.*
       ,m2.*
-      ,m3.*
   FROM [WH_AllPublishers].[Derived].[Customer] AS c
 --)
   INNER JOIN [WH_NWG].[Derived].[nw_cinid_mosaic] AS m
       ON c.[CINID] = m.[CINID]
   INNER JOIN [WH_NWG].[Derived].[nw_cinid_mosaic_8] AS m2
       ON c.[CINID] = m2.[CINID]
-  INNER JOIN [WH_NWG].[Derived].[nw_cinid_mosaic_8_v2] AS m3
-      ON c.[CINID] = m3.[CINID]
+)
+
+SELECT CustomerGUID, COUNT(*) AS ROWCOUNT
+FROM tbl
