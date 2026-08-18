@@ -428,6 +428,8 @@ DECLARE @groupNames NVARCHAR(MAX);
 DECLARE @sectorAffinityCols NVARCHAR(MAX);
 DECLARE @groupAffinityCols NVARCHAR(MAX);
 DECLARE @sql NVARCHAR(MAX);
+DECLARE @mCols NVARCHAR(MAX);
+DECLARE @m2Cols NVARCHAR(MAX);
 
 SELECT *
 INTO #fan_sector_affinity_avg
@@ -471,6 +473,22 @@ FROM (
     FROM #fan_group_affinity
 ) AS x;
 
+-- Build comma-separated lists of non-ID columns from the mosaic tables
+SELECT @mCols = STRING_AGG('m.' + QUOTENAME(c.name), ', ')
+FROM [WH_NWG].sys.columns c
+JOIN [WH_NWG].sys.objects o ON c.object_id = o.object_id
+JOIN [WH_NWG].sys.schemas s ON o.schema_id = s.schema_id
+WHERE s.name = 'Derived' AND o.name = 'nw_cinid_mosaic' AND c.[name] NOT LIKE '%ID%'
+
+SELECT @m2Cols = STRING_AGG('m2.' + QUOTENAME(c.name), ', ')
+FROM [WH_NWG].sys.columns c
+JOIN [WH_NWG].sys.objects o ON c.object_id = o.object_id
+JOIN [WH_NWG].sys.schemas s ON o.schema_id = s.schema_id
+WHERE s.name = 'Derived' AND o.name = 'nw_cinid_mosaic_8' AND c.[name] NOT LIKE '%ID%'
+
+SET @mCols = COALESCE(@mCols, '');
+SET @m2Cols = COALESCE(@m2Cols, '');
+
 SELECT @sectorAffinityCols = STRING_AGG(CAST(
     'COALESCE(sec.' + QUOTENAME(REPLACE([SectorName],']',']]')) + ',0) AS ' + QUOTENAME('sector:' + LOWER(REPLACE([SectorName], ' ', '')) + 'affinity') + ', ' +
     'CASE WHEN secavg.' + QUOTENAME(REPLACE([SectorName],']',']]')) + ' IS NULL OR secavg.' + QUOTENAME(REPLACE([SectorName],']',']]')) + ' = 0 THEN NULL ELSE COALESCE(sec.' + QUOTENAME(REPLACE([SectorName],']',']]')) + ',0) / secavg.' + QUOTENAME(REPLACE([SectorName],']',']]')) + ' END AS ' + QUOTENAME('sector:' + LOWER(REPLACE([SectorName], ' ', '')) + 'relativeaffinity')
@@ -490,7 +508,7 @@ FROM (
 ) AS x;
 
 SET @sql = N'
-SELECT
+SELECT DISTINCT
     cb.[FanID],
     cb.[Spend_7d],
     cb.[Spend_30d],
@@ -540,6 +558,36 @@ SELECT
     cb.[SectorSpendPct],
     cb.[FavouriteGroupName],
     cb.[GroupSpendPct],
+    cust.[PublisherType],
+    cust.[AccountType],
+    cust.[Title],
+    cust.[City],
+    cust.[County],
+    cust.[Region],
+    cust.[PostalSector],
+    cust.[PostCodeDistrict],
+    cust.[PostArea],
+    cust.[CAMEOCode],
+    cust.[Gender],
+    cust.[AgeCurrent],
+    cust.[AgeCurrentBandText],
+    cust.[CashbackPending],
+    cust.[CashbackAvailable],
+    cust.[CashbackLTV],
+    cust.[Unsubscribed],
+    cust.[Hardbounced],
+    cust.[EmailTracking],
+    cust.[MarketableByEmail],
+    cust.[MarketableByPush],
+    cust.[CurrentlyActive],
+    cust.[RegistrationDate],
+    cust.[DeactivatedDate],
+    cust.[AddedDate],
+    cust.[ModifiedDate],
+    cust.[IsCredit],
+    cust.[IsDebit],
+    ' + @mCols + N',
+    ' + @m2Cols + N',
     ' + @sectorAffinityCols + N',
     ' + @groupAffinityCols + N'
 FROM #customer_base AS cb
@@ -575,6 +623,25 @@ PIVOT (
     MAX([AvgOtherCustomerGroupAffinity]) FOR [GroupName] IN (' + @groupNames + N')
 ) AS grpavg
     ON cb.[FanID] = grpavg.[FanID]
+LEFT JOIN (
+    SELECT *
+    FROM (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY FanID ORDER BY AddedDate DESC) AS rn
+        FROM [WH_AllPublishers].[Derived].[Customer]
+    ) AS _cust
+    WHERE rn = 1
+) AS cust
+    ON cb.[FanID] = cust.[FanID]
+OUTER APPLY (
+    SELECT TOP (1) *
+    FROM [WH_NWG].[Derived].[nw_cinid_mosaic] mm
+    WHERE mm.[CINID] = cust.[CINID]
+) AS m
+OUTER APPLY (
+    SELECT TOP (1) *
+    FROM [WH_NWG].[Derived].[nw_cinid_mosaic_8] mm2
+    WHERE mm2.[CINID] = cust.[CINID]
+) AS m2
 ORDER BY cb.[Spend_365d] DESC;';
 
 EXEC sp_executesql @sql, N'@as_of_date DATE', @as_of_date = @as_of_date;
