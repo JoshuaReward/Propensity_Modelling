@@ -1,12 +1,12 @@
 SET NOCOUNT ON;
 
 DECLARE @as_of_date DATE = CAST(GETDATE() AS DATE);
-DECLARE @sample_size INT = 1000;
+DECLARE @sample_size INT = 2000000;
 DECLARE @lookback_7 INT = 7;
 DECLARE @lookback_30 INT = 30;
 DECLARE @lookback_90 INT = 90;
 DECLARE @lookback_365 INT = 365;
-DECLARE @lookback_days INT = 365; -- customizable lookback window (in days)
+DECLARE @lookback_days INT = 1460; -- customizable lookback window (in days)
 
 DECLARE @use_7 BIT;
 DECLARE @use_30 BIT;
@@ -33,7 +33,8 @@ SELECT TOP (@sample_size)
     st.FanID
 INTO #sampled_customers
 FROM [WH_AllPublishers].[Derived].[SchemeTrans] AS st
-WHERE st.FanID IS NOT NULL
+WHERE st.FanID IS NOT NULL 
+AND st.PublisherID = 132
 GROUP BY st.FanID
 ORDER BY NEWID();
 
