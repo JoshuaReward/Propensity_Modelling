@@ -188,6 +188,12 @@ DECLARE @feature_window_days           INT  = 90;        -- history used to buil
 DECLARE @label_window_days             INT  = 30;        -- target: spend in next N days
 DECLARE @restrict_sectors_to_observed  BIT  = 0;         -- 1 = smaller panel for dev
 
+-- Lifecycle bucketing thresholds (days since RegistrationDate, as of ReferenceDate).
+-- New: tenure < @new_customer_tenure_days. Mature: tenure >= @established_customer_tenure_days.
+-- Established: everything in between.
+DECLARE @new_customer_tenure_days         INT = 90;
+DECLARE @established_customer_tenure_days INT = 365;
+
 IF @cycle_length_days <> (@feature_window_days + @label_window_days)
     RAISERROR('Warning: cycle_length_days <> feature_window_days + label_window_days -- periods will overlap or leave gaps.', 10, 1) WITH NOWAIT;
 
@@ -199,7 +205,12 @@ IF @cycle_length_days <> (@feature_window_days + @label_window_days)
 DROP TABLE IF EXISTS #PublisherIDs;
 DROP TABLE IF EXISTS #SampledFanIDs;
 DROP TABLE IF EXISTS #CustomerLatest;
+DROP TABLE IF EXISTS #PublisherNames;
+DROP TABLE IF EXISTS #EasterDates;
+DROP TABLE IF EXISTS #YearEventDates;
+DROP TABLE IF EXISTS #KeyRetailEvents;
 DROP TABLE IF EXISTS #ReferenceDates;
+DROP TABLE IF EXISTS #PeriodKeyEventFeatures;
 DROP TABLE IF EXISTS #FilteredTransactions;
 DROP TABLE IF EXISTS #Transactions;
 DROP TABLE IF EXISTS #SectorDimension;
@@ -208,7 +219,16 @@ DROP TABLE IF EXISTS #PeriodLabelTransactions;
 DROP TABLE IF EXISTS #CustomerPeriodMetrics;
 DROP TABLE IF EXISTS #PeriodSectorLong;
 DROP TABLE IF EXISTS #PeriodGroupLong;
+DROP TABLE IF EXISTS #SectorPopularityByPeriod;
+DROP TABLE IF EXISTS #GroupPopularityByPeriod;
+DROP TABLE IF EXISTS #PublisherSectorPopularityByPeriod;
+DROP TABLE IF EXISTS #SectorMarginals;
+DROP TABLE IF EXISTS #SectorPairCooccurrence;
+DROP TABLE IF EXISTS #SectorPairLift;
+DROP TABLE IF EXISTS #CustomerSectorAffinity;
+DROP TABLE IF EXISTS #CustomerSpendEntropy;
 DROP TABLE IF EXISTS #PeriodLabel;
+DROP TABLE IF EXISTS #PeriodGroupLabel;
 DROP TABLE IF EXISTS #BasePanel;
 
 
@@ -234,6 +254,12 @@ WHERE LTRIM(RTRIM(s.value)) <> '';
 CREATE UNIQUE CLUSTERED INDEX IX_PublisherIDs_PublisherID ON #PublisherIDs(PublisherID);
 
 DECLARE @publisher_filter_count INT = (SELECT COUNT(*) FROM #PublisherIDs);
+
+-- Used downstream (final assembly) to gate the PublisherSectorPopularityPrior feature:
+-- it's only populated when a specific publisher subset is in play (see that section
+-- for why). PublisherID/PublisherName themselves are for post-training slicing and
+-- interpretability only -- they should NOT be fed into the model as features.
+DECLARE @publisher_filter_active BIT = CASE WHEN @publisher_filter_count > 0 THEN 1 ELSE 0 END;
 
 IF @publisher_filter_count > 0
     RAISERROR('Publisher filter ACTIVE: %d publisher(s) selected (see #PublisherIDs).', 10, 1, @publisher_filter_count) WITH NOWAIT;
@@ -328,6 +354,40 @@ SELECT COUNT_BIG(*) AS CustomerLatestCount FROM #CustomerLatest;
 
 
 /*==============================================================
+  4a. PUBLISHER DIMENSION (PublisherName, for interpretability and
+      post-training slicing only -- PublisherID/PublisherName are NOT
+      intended as model features, just a way to read results and cut
+      performance by publisher afterwards).
+
+  Source confirmed: [WH_AllPublishers].[Derived].[Publisher].[PublisherName],
+  joined on PublisherID (consistent with every other PublisherID column
+  in this schema, e.g. Derived.Customer). Deduped defensively with the
+  same ROW_NUMBER() pattern used for Brand/Sector/Group in stages 5-6,
+  in case this "Derived" table is also SCD-style with no single
+  current row per PublisherID -- if it's guaranteed one row per key,
+  the ROW_NUMBER() is a harmless no-op.
+==============================================================*/
+
+RAISERROR('Stage 4a: Loading Publisher dimension for PublisherName', 10, 1) WITH NOWAIT;
+
+;WITH PublisherOne AS
+(
+    SELECT PublisherID, PublisherName,
+        ROW_NUMBER() OVER (PARTITION BY PublisherID ORDER BY (SELECT NULL)) AS rn
+    FROM [WH_AllPublishers].[Derived].[Publisher]
+)
+SELECT PublisherID, PublisherName
+INTO #PublisherNames
+FROM PublisherOne
+WHERE rn = 1
+OPTION (RECOMPILE);
+
+CREATE UNIQUE CLUSTERED INDEX IX_PublisherNames_PublisherID ON #PublisherNames(PublisherID);
+
+SELECT COUNT_BIG(*) AS PublisherNamesLoaded FROM #PublisherNames;
+
+
+/*==============================================================
   5. REFERENCE-DATE SPINE
 ==============================================================*/
 
@@ -355,6 +415,176 @@ OPTION (MAXRECURSION 1000);
 CREATE UNIQUE CLUSTERED INDEX IX_ReferenceDates_PeriodIndex ON #ReferenceDates(PeriodIndex);
 
 SELECT * FROM #ReferenceDates ORDER BY PeriodIndex;
+
+
+/*==============================================================
+  5a. KEY RETAIL EVENT CALENDAR
+
+  A small calendar of UK retail shopping events, built for every
+  calendar year touched by any feature or label window in the spine
+  (+/- 1 year buffer). Used next to flag whether a customer's
+  feature/label window sits around Black Friday, Christmas, etc. --
+  without this, elevated spend around those dates looks like ordinary
+  customer-level propensity rather than a calendar effect, which the
+  model can't otherwise separate out.
+
+  Easter Sunday is computed per year via the standard Gregorian Easter
+  algorithm (anonymous/Meeus algorithm) rather than hard-coded, so it
+  stays correct for any @as_of_date. Black Friday is derived as the
+  4th Friday of November (DATEFIRST 1 is set at the top of this
+  script, so DATEPART(WEEKDAY, ...) = 5 is Friday throughout).
+
+  Extend/trim the event list below to match what actually matters for
+  your sectors (e.g. add Diwali, Ramadan/Eid if relevant to your
+  customer base -- both are lunar and would need an external date
+  table rather than a formula).
+==============================================================*/
+
+RAISERROR('Stage 5a: Building key retail event calendar', 10, 1) WITH NOWAIT;
+
+DECLARE @calendar_start_year INT = YEAR((SELECT MIN(FeatureWindowStart) FROM #ReferenceDates)) - 1;
+DECLARE @calendar_end_year   INT = YEAR((SELECT MAX(LabelWindowEnd) FROM #ReferenceDates)) + 1;
+
+;WITH Years AS
+(
+    SELECT @calendar_start_year AS CalendarYear
+    UNION ALL
+    SELECT CalendarYear + 1 FROM Years WHERE CalendarYear + 1 <= @calendar_end_year
+),
+E1 AS
+(
+    SELECT CalendarYear,
+        CalendarYear % 19 AS a,
+        CalendarYear / 100 AS b,
+        CalendarYear % 100 AS c
+    FROM Years
+),
+E2 AS
+(
+    SELECT CalendarYear, a, b, c,
+        b / 4 AS d,
+        b % 4 AS e,
+        (b + 8) / 25 AS f
+    FROM E1
+),
+E3 AS
+(
+    SELECT CalendarYear, a, b, c, d, e,
+        (b - f + 1) / 3 AS g
+    FROM E2
+),
+E4 AS
+(
+    SELECT CalendarYear, a, e,
+        (19 * a + b - d - g + 15) % 30 AS h,
+        c / 4 AS i,
+        c % 4 AS k
+    FROM E3
+),
+E5 AS
+(
+    SELECT CalendarYear, a, h,
+        (32 + 2 * e + 2 * i - h - k) % 7 AS l
+    FROM E4
+),
+E6 AS
+(
+    SELECT CalendarYear, h, l,
+        (a + 11 * h + 22 * l) / 451 AS m
+    FROM E5
+)
+SELECT
+    CalendarYear,
+    DATEFROMPARTS(
+        CalendarYear,
+        (h + l - 7 * m + 114) / 31,
+        ((h + l - 7 * m + 114) % 31) + 1
+    ) AS EasterSunday
+INTO #EasterDates
+FROM E6
+OPTION (MAXRECURSION 100);
+
+CREATE UNIQUE CLUSTERED INDEX IX_EasterDates_Year ON #EasterDates(CalendarYear);
+
+;WITH NovemberFirsts AS
+(
+    SELECT CalendarYear, EasterSunday, DATEFROMPARTS(CalendarYear, 11, 1) AS NovemberFirst
+    FROM #EasterDates
+),
+FirstFridays AS
+(
+    SELECT CalendarYear, EasterSunday,
+        DATEADD(DAY, (5 - DATEPART(WEEKDAY, NovemberFirst) + 7) % 7, NovemberFirst) AS FirstFridayInNovember
+    FROM NovemberFirsts
+)
+SELECT
+    CalendarYear,
+    EasterSunday,
+    DATEADD(DAY, 21, FirstFridayInNovember) AS BlackFriday
+INTO #YearEventDates
+FROM FirstFridays
+OPTION (RECOMPILE);
+
+CREATE UNIQUE CLUSTERED INDEX IX_YearEventDates_Year ON #YearEventDates(CalendarYear);
+
+SELECT DATEFROMPARTS(CalendarYear, 1, 1) AS EventDate, 'New Year''s Day' AS EventName
+INTO #KeyRetailEvents FROM #YearEventDates
+UNION ALL SELECT DATEFROMPARTS(CalendarYear, 2, 14), 'Valentine''s Day' FROM #YearEventDates
+UNION ALL SELECT DATEADD(DAY, -2, EasterSunday), 'Good Friday' FROM #YearEventDates
+UNION ALL SELECT EasterSunday, 'Easter Sunday' FROM #YearEventDates
+UNION ALL SELECT DATEADD(DAY, 1, EasterSunday), 'Easter Monday' FROM #YearEventDates
+UNION ALL SELECT DATEFROMPARTS(CalendarYear, 9, 1), 'Back to School' FROM #YearEventDates
+UNION ALL SELECT DATEFROMPARTS(CalendarYear, 10, 31), 'Halloween' FROM #YearEventDates
+UNION ALL SELECT BlackFriday, 'Black Friday' FROM #YearEventDates
+UNION ALL SELECT DATEADD(DAY, 3, BlackFriday), 'Cyber Monday' FROM #YearEventDates
+UNION ALL SELECT DATEFROMPARTS(CalendarYear, 12, 24), 'Christmas Eve' FROM #YearEventDates
+UNION ALL SELECT DATEFROMPARTS(CalendarYear, 12, 25), 'Christmas Day' FROM #YearEventDates
+UNION ALL SELECT DATEFROMPARTS(CalendarYear, 12, 26), 'Boxing Day' FROM #YearEventDates
+UNION ALL SELECT DATEFROMPARTS(CalendarYear, 12, 31), 'New Year''s Eve' FROM #YearEventDates;
+
+CREATE CLUSTERED INDEX IX_KeyRetailEvents_EventDate ON #KeyRetailEvents(EventDate);
+
+SELECT * FROM #KeyRetailEvents ORDER BY EventDate;
+
+
+/*==============================================================
+  5b. PERIOD KEY-EVENT FEATURES
+
+  Per reference period: whether the label window (the 30 days whose
+  spend we're predicting) overlaps a key event, whether the feature
+  window (recent history) did, and the name of / signed days to the
+  nearest event relative to the label window start (negative = the
+  event falls before the label window starts, positive = it falls on
+  or after). Joined onto every row of the final panel by PeriodIndex.
+==============================================================*/
+
+RAISERROR('Stage 5b: Calculating period key-event features', 10, 1) WITH NOWAIT;
+
+SELECT
+    rd.PeriodIndex,
+    CASE WHEN EXISTS (
+        SELECT 1 FROM #KeyRetailEvents AS ke
+        WHERE ke.EventDate >= rd.LabelWindowStart AND ke.EventDate < rd.LabelWindowEnd
+    ) THEN 1 ELSE 0 END AS LabelWindowOverlapsKeyEvent,
+    CASE WHEN EXISTS (
+        SELECT 1 FROM #KeyRetailEvents AS ke
+        WHERE ke.EventDate >= rd.FeatureWindowStart AND ke.EventDate < rd.FeatureWindowEnd
+    ) THEN 1 ELSE 0 END AS FeatureWindowOverlapsKeyEvent,
+    nearest.EventName AS LabelWindowNearestKeyEventName,
+    nearest.DaysFromLabelWindowStart AS LabelWindowDaysToNearestKeyEvent
+INTO #PeriodKeyEventFeatures
+FROM #ReferenceDates AS rd
+OUTER APPLY
+(
+    SELECT TOP (1) ke.EventName, DATEDIFF(DAY, rd.LabelWindowStart, ke.EventDate) AS DaysFromLabelWindowStart
+    FROM #KeyRetailEvents AS ke
+    ORDER BY ABS(DATEDIFF(DAY, rd.LabelWindowStart, ke.EventDate)) ASC
+) AS nearest
+OPTION (RECOMPILE);
+
+CREATE UNIQUE CLUSTERED INDEX IX_PeriodKeyEventFeatures_PeriodIndex ON #PeriodKeyEventFeatures(PeriodIndex);
+
+SELECT * FROM #PeriodKeyEventFeatures ORDER BY PeriodIndex;
 
 
 /*==============================================================
@@ -524,7 +754,7 @@ CREATE INDEX IX_PFT_FanPeriodSector ON #PeriodFeatureTransactions(FanID, PeriodI
     INCLUDE (Spend, TranDate, PurchaseDate, SectorGroupID, BrandID);
 
 SELECT
-    t.FanID, t.SectorID, t.Spend, t.TranDate, rd.PeriodIndex
+    t.FanID, t.SectorID, t.SectorGroupID, t.Spend, t.TranDate, rd.PeriodIndex
 INTO #PeriodLabelTransactions
 FROM #Transactions AS t
 INNER JOIN #ReferenceDates AS rd
@@ -532,6 +762,8 @@ INNER JOIN #ReferenceDates AS rd
 OPTION (RECOMPILE);
 
 CREATE CLUSTERED INDEX IX_PLT_FanPeriodSector ON #PeriodLabelTransactions(FanID, PeriodIndex, SectorID);
+CREATE INDEX IX_PLT_FanPeriodGroup ON #PeriodLabelTransactions(FanID, PeriodIndex, SectorGroupID)
+    INCLUDE (Spend, TranDate);
 
 SELECT COUNT_BIG(*) AS FeatureWindowRows FROM #PeriodFeatureTransactions;
 SELECT COUNT_BIG(*) AS LabelWindowRows FROM #PeriodLabelTransactions;
@@ -709,6 +941,207 @@ SELECT COUNT_BIG(*) AS PeriodSectorLongCount FROM #PeriodSectorLong;
 
 
 /*==============================================================
+  11a. SECTOR & GROUP POPULARITY PRIORS
+
+  "How common is this sector right now, across the population?" --
+  a standard recommender-style prior. Lets the model separate "this
+  sector is just popular this period" from "this customer specifically
+  is drawn to it" instead of learning that conflation implicitly.
+  Computed as the share of the SAMPLED population with >=1 transaction
+  in the sector during that period's feature window -- at
+  @sample_size = 10000 this is already a reasonably large base, but
+  it's still the dev sample, not the full population; recompute from
+  the full customer base before using this for production training,
+  and expect it to be noisier for periods/sectors with few positives.
+
+  The per-publisher variant follows the same idea but denominated
+  against only that publisher's sampled customers, and is only
+  populated in the final panel when @publisher_ids selects a specific
+  subset (@publisher_filter_active = 1) -- see note at declaration.
+  With no filter, the sample can span many publishers of very
+  different sizes and behaviour, and a per-publisher split of an
+  arbitrary unfiltered sample is more likely to be noise than signal.
+==============================================================*/
+
+RAISERROR('Stage 11a: Calculating sector & group popularity priors', 10, 1) WITH NOWAIT;
+
+DECLARE @total_sampled_customers INT = (SELECT COUNT(*) FROM #CustomerLatest);
+
+SELECT
+    pft.PeriodIndex,
+    pft.SectorID,
+    COUNT(DISTINCT pft.FanID) AS SectorActiveCustomers,
+    CONVERT(DECIMAL(18,6), COUNT(DISTINCT pft.FanID) * 1.0 / NULLIF(@total_sampled_customers, 0)) AS SectorPopularityPrior
+INTO #SectorPopularityByPeriod
+FROM #PeriodFeatureTransactions AS pft
+GROUP BY pft.PeriodIndex, pft.SectorID
+OPTION (RECOMPILE);
+
+CREATE UNIQUE CLUSTERED INDEX IX_SectorPopularityByPeriod ON #SectorPopularityByPeriod(PeriodIndex, SectorID);
+
+SELECT
+    pft.PeriodIndex,
+    pft.SectorGroupID,
+    COUNT(DISTINCT pft.FanID) AS GroupActiveCustomers,
+    CONVERT(DECIMAL(18,6), COUNT(DISTINCT pft.FanID) * 1.0 / NULLIF(@total_sampled_customers, 0)) AS GroupPopularityPrior
+INTO #GroupPopularityByPeriod
+FROM #PeriodFeatureTransactions AS pft
+GROUP BY pft.PeriodIndex, pft.SectorGroupID
+OPTION (RECOMPILE);
+
+CREATE UNIQUE CLUSTERED INDEX IX_GroupPopularityByPeriod ON #GroupPopularityByPeriod(PeriodIndex, SectorGroupID);
+
+SELECT
+    cl.PublisherID,
+    pft.PeriodIndex,
+    pft.SectorID,
+    COUNT(DISTINCT pft.FanID) AS PublisherSectorActiveCustomers,
+    pubtotal.PublisherCustomerCount,
+    CONVERT(DECIMAL(18,6), COUNT(DISTINCT pft.FanID) * 1.0 / NULLIF(pubtotal.PublisherCustomerCount, 0)) AS PublisherSectorPopularityPrior
+INTO #PublisherSectorPopularityByPeriod
+FROM #PeriodFeatureTransactions AS pft
+INNER JOIN #CustomerLatest AS cl ON cl.FanID = pft.FanID
+INNER JOIN
+(
+    SELECT PublisherID, COUNT(*) AS PublisherCustomerCount
+    FROM #CustomerLatest
+    GROUP BY PublisherID
+) AS pubtotal ON pubtotal.PublisherID = cl.PublisherID
+GROUP BY cl.PublisherID, pft.PeriodIndex, pft.SectorID, pubtotal.PublisherCustomerCount
+OPTION (RECOMPILE);
+
+CREATE UNIQUE CLUSTERED INDEX IX_PublisherSectorPopularityByPeriod ON #PublisherSectorPopularityByPeriod(PublisherID, PeriodIndex, SectorID);
+
+SELECT COUNT_BIG(*) AS SectorPopularityRows FROM #SectorPopularityByPeriod;
+
+
+/*==============================================================
+  11b. SECTOR-SECTOR CO-OCCURRENCE & LIFT
+
+  Market-basket-style association between sectors: for every ordered
+  pair (A, B), Lift(A -> B) = P(B | basket has A) / P(B) across all
+  (FanID, PeriodIndex) "baskets" in #PeriodSectorLong (a basket here
+  is everything one customer bought across sectors within one
+  feature window). Lift > 1 means having spent in A makes spending in
+  B more likely than B's base rate alone would suggest; Lift = 1 means
+  no association either way; Lift < 1 means a negative association.
+  This is pooled across all sampled customers and periods together
+  (not per period) since a single period's baskets are fairly sparse
+  and a stable structural relationship is what we want here, not a
+  period-specific one.
+
+  Sector cardinality (a few dozen to ~100, not brand-level) keeps this
+  a small dense-ish matrix -- if sectors are added or this later gets
+  pushed down to Brand level, revisit before assuming it stays cheap.
+==============================================================*/
+
+RAISERROR('Stage 11b: Calculating sector-sector co-occurrence & lift', 10, 1) WITH NOWAIT;
+
+DECLARE @total_sector_baskets INT =
+(
+    SELECT COUNT(*) FROM (SELECT DISTINCT FanID, PeriodIndex FROM #PeriodSectorLong) AS b
+);
+
+SELECT SectorID, COUNT(*) AS SectorBasketCount
+INTO #SectorMarginals
+FROM #PeriodSectorLong
+GROUP BY SectorID
+OPTION (RECOMPILE);
+
+CREATE UNIQUE CLUSTERED INDEX IX_SectorMarginals ON #SectorMarginals(SectorID);
+
+SELECT
+    a.SectorID AS SourceSectorID,
+    b.SectorID AS TargetSectorID,
+    COUNT(*) AS PairBasketCount
+INTO #SectorPairCooccurrence
+FROM #PeriodSectorLong AS a
+INNER JOIN #PeriodSectorLong AS b
+    ON a.FanID = b.FanID AND a.PeriodIndex = b.PeriodIndex AND a.SectorID <> b.SectorID
+GROUP BY a.SectorID, b.SectorID
+OPTION (RECOMPILE);
+
+CREATE UNIQUE CLUSTERED INDEX IX_SectorPairCooccurrence ON #SectorPairCooccurrence(SourceSectorID, TargetSectorID);
+
+SELECT
+    spc.SourceSectorID,
+    spc.TargetSectorID,
+    CONVERT(DECIMAL(18,6),
+        (spc.PairBasketCount * 1.0 / NULLIF(sm_src.SectorBasketCount, 0))
+        / NULLIF(sm_tgt.SectorBasketCount * 1.0 / NULLIF(@total_sector_baskets, 0), 0)
+    ) AS Lift_SourceToTarget
+INTO #SectorPairLift
+FROM #SectorPairCooccurrence AS spc
+INNER JOIN #SectorMarginals AS sm_src ON sm_src.SectorID = spc.SourceSectorID
+INNER JOIN #SectorMarginals AS sm_tgt ON sm_tgt.SectorID = spc.TargetSectorID
+OPTION (RECOMPILE);
+
+CREATE UNIQUE CLUSTERED INDEX IX_SectorPairLift ON #SectorPairLift(SourceSectorID, TargetSectorID);
+
+SELECT COUNT_BIG(*) AS SectorPairCount FROM #SectorPairLift;
+
+
+/*==============================================================
+  11c. CUSTOMER-SECTOR AFFINITY SCORE (CROSS-SELL SIGNAL)
+
+  For each (FanID, PeriodIndex, TargetSectorID), a spend-share-weighted
+  average of Lift(S -> TargetSectorID) across every sector S the
+  customer already has spend in during that feature window. This is
+  the "people who buy what you buy also buy here" signal -- it's the
+  main thing this panel was missing for scoring propensity into
+  sectors a customer has never used, since every other feature only
+  looks at the customer's OWN history in the target sector itself.
+
+  Coalesced to 1 (not 0) downstream when no pair evidence exists --
+  1 is the neutral "no observed association" value for a lift ratio;
+  0 would wrongly read as "strong negative signal".
+==============================================================*/
+
+RAISERROR('Stage 11c: Calculating customer-sector affinity scores', 10, 1) WITH NOWAIT;
+
+SELECT
+    psl.FanID,
+    psl.PeriodIndex,
+    spl.TargetSectorID AS SectorID,
+    CONVERT(DECIMAL(18,6), SUM(psl.SectorSpendPct * spl.Lift_SourceToTarget) / NULLIF(SUM(psl.SectorSpendPct), 0)) AS SectorCoOccurrenceAffinityScore
+INTO #CustomerSectorAffinity
+FROM #PeriodSectorLong AS psl
+INNER JOIN #SectorPairLift AS spl ON spl.SourceSectorID = psl.SectorID
+GROUP BY psl.FanID, psl.PeriodIndex, spl.TargetSectorID
+OPTION (RECOMPILE);
+
+CREATE UNIQUE CLUSTERED INDEX IX_CustomerSectorAffinity ON #CustomerSectorAffinity(FanID, PeriodIndex, SectorID);
+
+SELECT COUNT_BIG(*) AS CustomerSectorAffinityRows FROM #CustomerSectorAffinity;
+
+
+/*==============================================================
+  11d. CUSTOMER SPEND DIVERSITY / ENTROPY SCORE
+
+  Shannon entropy (base 2) of a customer's spend split across sectors
+  within the feature window: 0 = all spend in one sector (fully
+  concentrated), higher = spend spread evenly across more sectors.
+  This is a sharper "how exploratory is this customer" signal than
+  UniqueSectors_90d alone -- two customers can both touch 3 sectors,
+  but one puts 90% of spend in one of them and the other splits it
+  evenly; entropy tells them apart, which matters because spread-out
+  spenders are generally better cross-sell targets than loyal ones.
+==============================================================*/
+
+RAISERROR('Stage 11d: Calculating customer spend diversity/entropy', 10, 1) WITH NOWAIT;
+
+SELECT
+    FanID, PeriodIndex,
+    CONVERT(DECIMAL(18,6), -SUM(CASE WHEN SectorSpendPct > 0 THEN SectorSpendPct * LOG(SectorSpendPct, 2) ELSE 0 END)) AS SpendEntropyBits_FeatureWindow
+INTO #CustomerSpendEntropy
+FROM #PeriodSectorLong
+GROUP BY FanID, PeriodIndex
+OPTION (RECOMPILE);
+
+CREATE UNIQUE CLUSTERED INDEX IX_CustomerSpendEntropy ON #CustomerSpendEntropy(FanID, PeriodIndex);
+
+
+/*==============================================================
   12. GROUP-LEVEL CONTEXT FEATURES PER PERIOD (same pattern)
 ==============================================================*/
 
@@ -719,12 +1152,13 @@ RAISERROR('Stage 10: Calculating group-level period features', 10, 1) WITH NOWAI
     SELECT
         FanID, PeriodIndex, SectorGroupID,
         SUM(Spend) AS GroupSpend,
-        COUNT_BIG(*) AS GroupPurchases
+        COUNT_BIG(*) AS GroupPurchases,
+        MAX(TranDate) AS LastGroupPurchaseDate
     FROM #PeriodFeatureTransactions
     GROUP BY FanID, PeriodIndex, SectorGroupID
 )
 SELECT
-    FanID, PeriodIndex, SectorGroupID, GroupSpend, GroupPurchases,
+    FanID, PeriodIndex, SectorGroupID, GroupSpend, GroupPurchases, LastGroupPurchaseDate,
     CONVERT(DECIMAL(18,6), GroupSpend / NULLIF(SUM(GroupSpend) OVER (PARTITION BY FanID, PeriodIndex), 0)) AS GroupSpendPct,
     CONVERT(DECIMAL(18,6), 1.0 * GroupPurchases / NULLIF(SUM(GroupPurchases) OVER (PARTITION BY FanID, PeriodIndex), 0)) AS GroupTxnAffinity,
     CONVERT(BIT, 1) AS HasGroupTransaction_Feature,
@@ -756,6 +1190,34 @@ CREATE UNIQUE CLUSTERED INDEX IX_PeriodLabel_FanSectorPeriod ON #PeriodLabel(Fan
 
 SELECT PeriodIndex, COUNT(*) AS SectorPositives, SUM(SectorSpend_Next30d) AS TotalSpend
 FROM #PeriodLabel GROUP BY PeriodIndex ORDER BY PeriodIndex;
+
+
+/*==============================================================
+  13a. GROUP LABEL: SPEND IN GROUP IN THE NEXT @label_window_days DAYS
+
+  Same construction as stage 13, one level up: lets the group-level
+  model (predict "will they spend in this group next") train directly
+  off this panel too, alongside the sector-level target above -- useful
+  given the two-stage sector/group -> brand approach being taken.
+  Column names follow the same underscore convention as the Sector
+  target (SectorSpend_Next30d etc).
+==============================================================*/
+
+RAISERROR('Stage 13a: Constructing group-level labels', 10, 1) WITH NOWAIT;
+
+SELECT
+    FanID, SectorGroupID, PeriodIndex,
+    SUM(Spend) AS GroupSpend_Next30d,
+    COUNT_BIG(*) AS GroupPurchases_Next30d,
+    CONVERT(BIT, 1) AS HasGroupSpend_Next30d
+INTO #PeriodGroupLabel
+FROM #PeriodLabelTransactions
+GROUP BY FanID, SectorGroupID, PeriodIndex;
+
+CREATE UNIQUE CLUSTERED INDEX IX_PeriodGroupLabel_FanGroupPeriod ON #PeriodGroupLabel(FanID, SectorGroupID, PeriodIndex);
+
+SELECT PeriodIndex, COUNT(*) AS GroupPositives, SUM(GroupSpend_Next30d) AS TotalGroupSpend
+FROM #PeriodGroupLabel GROUP BY PeriodIndex ORDER BY PeriodIndex;
 
 
 /*==============================================================
@@ -791,20 +1253,41 @@ SELECT
     DATEADD(DAY, @label_window_days, bp.ReferenceDate) AS LabelWindowEnd,
     bp.SectorID, bp.SectorName, bp.SectorGroupID, bp.GroupName,
 
-    /* Customer attributes -- current snapshot, see header note */
-    cl.PublisherType, cl.PublisherID, cl.AccountType, cl.City, cl.County, cl.Region, cl.PostalSector,
+    /* Customer attributes -- current snapshot, see header note.
+       PublisherType/PublisherID/PublisherName are for post-training
+       slicing & interpretability ONLY -- exclude them from the actual
+       model feature set (see note at @publisher_filter_active). */
+    cl.PublisherType, cl.PublisherID, pubn.PublisherName,
+    cl.AccountType, cl.City, cl.County, cl.Region, cl.PostalSector,
     cl.PostCodeDistrict, cl.PostArea, cl.CAMEOCode, cl.Gender, cl.AgeCurrent, cl.AgeCurrentBandText,
     cl.CashbackPending, cl.CashbackAvailable, cl.CashbackLTV, cl.Unsubscribed, cl.Hardbounced,
     cl.EmailTracking, cl.MarketableByEmail, cl.MarketableByPush, cl.CurrentlyActive,
     cl.RegistrationDate, cl.DeactivatedDate, cl.IsDebit,
-    CASE WHEN cl.RegistrationDate IS NULL THEN NULL
-         ELSE DATEDIFF(DAY, cl.RegistrationDate, bp.ReferenceDate) END AS CustomerTenureDays_AsOfReferenceDate,
+    tenure.TenureDays AS CustomerTenureDays_AsOfReferenceDate,
+
+    /* Lifecycle stage as of ReferenceDate, bucketed by
+       @new_customer_tenure_days / @established_customer_tenure_days. */
+    CASE WHEN tenure.TenureDays IS NULL THEN NULL
+         WHEN tenure.TenureDays < @new_customer_tenure_days THEN 1
+         ELSE 0 END AS IsNewCustomer,
+    CASE WHEN tenure.TenureDays IS NULL THEN 'Unknown'
+         WHEN tenure.TenureDays < @new_customer_tenure_days THEN 'New'
+         WHEN tenure.TenureDays < @established_customer_tenure_days THEN 'Established'
+         ELSE 'Mature' END AS CustomerLifecycleStage,
 
     /* Calendar / seasonality -- replaces the 365d seasonal block, see header note */
     MONTH(bp.ReferenceDate) AS ReferenceMonth,
     DATEPART(QUARTER, bp.ReferenceDate) AS ReferenceQuarter,
     CONVERT(DECIMAL(9,6), SIN(2 * PI() * MONTH(bp.ReferenceDate) / 12.0)) AS ReferenceMonthSin,
     CONVERT(DECIMAL(9,6), COS(2 * PI() * MONTH(bp.ReferenceDate) / 12.0)) AS ReferenceMonthCos,
+
+    /* Key-retail-event seasonality: does the window whose spend we're
+       predicting (or the recent history window) sit around Black
+       Friday/Christmas/etc, and how far away is the nearest one? */
+    COALESCE(pke.LabelWindowOverlapsKeyEvent, 0) AS LabelWindowOverlapsKeyEvent,
+    COALESCE(pke.FeatureWindowOverlapsKeyEvent, 0) AS FeatureWindowOverlapsKeyEvent,
+    pke.LabelWindowNearestKeyEventName,
+    pke.LabelWindowDaysToNearestKeyEvent,
 
     /* Customer-period features (sector-agnostic) */
     COALESCE(cpm.Spend_7d, 0) AS Spend_7d,
@@ -869,9 +1352,41 @@ SELECT
 
     /* Group-level context (the row's parent group) */
     COALESCE(pgl.HasGroupTransaction_Feature, 0) AS HasGroupTransaction_Last90d,
+    COALESCE(pgl.GroupSpend, 0) AS GroupSpend_Last90d,
+    COALESCE(pgl.GroupPurchases, 0) AS GroupPurchases_Last90d,
     COALESCE(pgl.GroupSpendPct, 0) AS GroupSpendPct_Last90d,
     COALESCE(pgl.GroupTxnAffinity, 0) AS GroupTxnAffinity_Last90d,
+    pgl.LastGroupPurchaseDate,
+    CASE WHEN pgl.LastGroupPurchaseDate IS NULL THEN NULL
+         ELSE DATEDIFF(DAY, pgl.LastGroupPurchaseDate, bp.ReferenceDate) END AS DaysSinceLastGroupPurchase_CappedAtWindow,
     COALESCE(pgl.IsFavouriteGroupInWindow, 0) AS IsFavouriteGroupInWindow,
+
+    /* Sector/group popularity priors -- "how common is this sector/group
+       right now, across the population" (see stage 11a). Lets the model
+       separate general popularity from customer-specific propensity. */
+    COALESCE(spop.SectorPopularityPrior, 0) AS SectorPopularityPrior,
+    COALESCE(gpop.GroupPopularityPrior, 0) AS GroupPopularityPrior,
+
+    /* Per-publisher sector popularity -- ONLY populated when @publisher_ids
+       selects a specific subset (@publisher_filter_active = 1); NULL
+       otherwise, since splitting an unfiltered/all-publisher sample this
+       way is more likely to add noise than signal (see stage 11a). */
+    CASE WHEN @publisher_filter_active = 1 THEN psp.PublisherSectorPopularityPrior ELSE NULL END AS PublisherSectorPopularityPrior,
+
+    /* Sector-sector co-occurrence/lift-based cross-sell affinity (stage
+       11c). Coalesced to 1 (neutral/no-association), not 0 -- see that
+       stage's note on why 0 would misrepresent "no evidence either way". */
+    COALESCE(csa.SectorCoOccurrenceAffinityScore, 1) AS SectorCoOccurrenceAffinityScore,
+
+    /* Spend diversity/entropy across sectors this period (stage 11d).
+       Evenness normalises entropy to 0-1 by the customer's own sector
+       count so it's comparable across customers with different reach;
+       0 when the customer has activity in 0 or 1 sectors (no diversity
+       possible), consistent with entropy itself being 0 in that case. */
+    COALESCE(cse.SpendEntropyBits_FeatureWindow, 0) AS CustomerSpendEntropyBits_FeatureWindow,
+    CASE WHEN COALESCE(cpm.UniqueSectors_90d, 0) > 1
+         THEN CONVERT(DECIMAL(18,6), COALESCE(cse.SpendEntropyBits_FeatureWindow, 0) / LOG(cpm.UniqueSectors_90d, 2))
+         ELSE 0 END AS CustomerSpendEvennessScore_FeatureWindow,
 
     /* TARGET: spend in this sector in the next @label_window_days days.
        HasSectorSpend_Next30d is the classifier target; the spend/purchase
@@ -879,14 +1394,35 @@ SELECT
        never use them as model features. */
     COALESCE(pl.HasSectorSpend_Next30d, 0) AS HasSectorSpend_Next30d,
     COALESCE(pl.SectorSpend_Next30d, 0) AS SectorSpend_Next30d,
-    COALESCE(pl.SectorPurchases_Next30d, 0) AS SectorPurchases_Next30d
+    COALESCE(pl.SectorPurchases_Next30d, 0) AS SectorPurchases_Next30d,
+
+    /* TARGET (group grain): same idea, one level up, for a group-level
+       model. HasGroupSpend_Next30d is that classifier's target; the
+       spend/purchase magnitudes are diagnostics only -- same caution
+       as the sector target above, never use them as model features. */
+    COALESCE(pglabel.HasGroupSpend_Next30d, 0) AS HasGroupSpend_Next30d,
+    COALESCE(pglabel.GroupSpend_Next30d, 0) AS GroupSpend_Next30d,
+    COALESCE(pglabel.GroupPurchases_Next30d, 0) AS GroupPurchases_Next30d
 
 FROM #BasePanel AS bp
 INNER JOIN #CustomerLatest AS cl ON cl.FanID = bp.FanID
+CROSS APPLY
+(
+    SELECT CASE WHEN cl.RegistrationDate IS NULL THEN NULL
+                ELSE DATEDIFF(DAY, cl.RegistrationDate, bp.ReferenceDate) END AS TenureDays
+) AS tenure
+LEFT JOIN #PublisherNames AS pubn ON pubn.PublisherID = cl.PublisherID
+LEFT JOIN #PeriodKeyEventFeatures AS pke ON pke.PeriodIndex = bp.PeriodIndex
 LEFT JOIN #CustomerPeriodMetrics AS cpm ON cpm.FanID = bp.FanID AND cpm.PeriodIndex = bp.PeriodIndex
 LEFT JOIN #PeriodSectorLong AS psl ON psl.FanID = bp.FanID AND psl.PeriodIndex = bp.PeriodIndex AND psl.SectorID = bp.SectorID
 LEFT JOIN #PeriodGroupLong AS pgl ON pgl.FanID = bp.FanID AND pgl.PeriodIndex = bp.PeriodIndex AND pgl.SectorGroupID = bp.SectorGroupID
+LEFT JOIN #SectorPopularityByPeriod AS spop ON spop.PeriodIndex = bp.PeriodIndex AND spop.SectorID = bp.SectorID
+LEFT JOIN #GroupPopularityByPeriod AS gpop ON gpop.PeriodIndex = bp.PeriodIndex AND gpop.SectorGroupID = bp.SectorGroupID
+LEFT JOIN #PublisherSectorPopularityByPeriod AS psp ON psp.PublisherID = cl.PublisherID AND psp.PeriodIndex = bp.PeriodIndex AND psp.SectorID = bp.SectorID
+LEFT JOIN #CustomerSectorAffinity AS csa ON csa.FanID = bp.FanID AND csa.PeriodIndex = bp.PeriodIndex AND csa.SectorID = bp.SectorID
+LEFT JOIN #CustomerSpendEntropy AS cse ON cse.FanID = bp.FanID AND cse.PeriodIndex = bp.PeriodIndex
 LEFT JOIN #PeriodLabel AS pl ON pl.FanID = bp.FanID AND pl.PeriodIndex = bp.PeriodIndex AND pl.SectorID = bp.SectorID
+LEFT JOIN #PeriodGroupLabel AS pglabel ON pglabel.FanID = bp.FanID AND pglabel.PeriodIndex = bp.PeriodIndex AND pglabel.SectorGroupID = bp.SectorGroupID
 OPTION (RECOMPILE);
 
 RAISERROR('Stage 13 complete: final modelling panel returned', 10, 1) WITH NOWAIT;
