@@ -1,0 +1,25 @@
+# Data: customer extracts and model artefacts never go in git
+*.csv
+*.tsv
+*.parquet
+*.feather
+*.pkl
+*.pickle
+customer_sector_date.xlsx
+WebApp/data/
+
+# Python
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.env
+
+# Editors
+.vs/
+
+# Terraform (lock files ARE committed)
+.terraform/
+*.tfstate
+*.tfstate.*
+tfplan

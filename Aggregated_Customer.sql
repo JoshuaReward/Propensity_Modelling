@@ -1459,7 +1459,6 @@ UNION ALL
 SELECT 'BrandSector', SectorID, COUNT(*)
 FROM [WH_AllPublishers].[Trans].[BrandSector]
 GROUP BY SectorID HAVING COUNT(*) > 1
-
 UNION ALL
 
 SELECT 'BrandSectorGroup', SectorGroupID, COUNT(*)
